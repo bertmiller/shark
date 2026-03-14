@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+vllm-venv/
+.venv/
+venv/
+
+# Models (large files)
+models/
+
+# Artifacts & traces
+artifacts/
+mooncake-traces/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Claude
+.claude/
