@@ -77,11 +77,19 @@ class ActionTapeRuntime:
         self,
         actions_by_tick: dict[int, TickAction],
         log_path: str | os.PathLike[str] | None = None,
+        tape_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self._actions_by_tick = actions_by_tick
-        self._log_path = Path(log_path) if log_path else None
-        if self._log_path is not None:
-            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._tape_path = Path(tape_path) if tape_path else None
+        self._tape_mtime: float | None = (
+            self._tape_path.stat().st_mtime if self._tape_path else None
+        )
+        self._log_base = Path(log_path) if log_path else None
+        self._reset_count = 0
+        self._log_path: Path | None = None
+        if self._log_base is not None:
+            self._log_base.parent.mkdir(parents=True, exist_ok=True)
+            self._log_path = self._numbered_log_path()
             self._log_path.write_text("", encoding="utf-8")
 
     @classmethod
@@ -92,10 +100,44 @@ class ActionTapeRuntime:
             raise ValueError(
                 f"{ACTION_TAPE_ENV_VAR} must be set for tape-driven scheduling"
             )
-        return cls(actions_by_tick=load_action_tape(tape_path), log_path=log_path)
+        return cls(
+            actions_by_tick=load_action_tape(tape_path),
+            log_path=log_path,
+            tape_path=tape_path,
+        )
 
     def action_for_tick(self, tick: int) -> TickAction:
         return self._actions_by_tick.get(tick, TickAction.empty(tick))
+
+    def reset_from_data(self, actions_by_tick: dict[int, TickAction]) -> None:
+        """Replace the current tape with new data and start a new log file."""
+        self._actions_by_tick = actions_by_tick
+        if self._log_base is not None:
+            self._reset_count += 1
+            self._log_path = self._numbered_log_path()
+            self._log_path.write_text("", encoding="utf-8")
+
+    def _numbered_log_path(self) -> Path:
+        base = self._log_base
+        return base.with_stem(f"{base.stem}_{self._reset_count}")
+
+    def maybe_reload(self) -> bool:
+        """Re-read the tape file if it changed on disk. Returns True if reloaded."""
+        if self._tape_path is None:
+            return False
+        try:
+            mtime = self._tape_path.stat().st_mtime
+        except OSError:
+            return False
+        if mtime == self._tape_mtime:
+            return False
+        self._tape_mtime = mtime
+        self._actions_by_tick = load_action_tape(self._tape_path)
+        if self._log_base is not None:
+            self._reset_count += 1
+            self._log_path = self._numbered_log_path()
+            self._log_path.write_text("", encoding="utf-8")
+        return True
 
     def begin_tick(self, scheduler: Any, tick: int, action: TickAction) -> dict[str, Any]:
         return {
@@ -151,16 +193,43 @@ class ActionTapeRuntime:
         return {
             "queue_depth": len(waiting),
             "num_running": len(running),
-            "waiting_request_ids": [request.request_id for request in waiting],
-            "running_request_ids": [request.request_id for request in running],
+            "waiting": [self._request_meta(r) for r in waiting],
+            "running": [self._request_meta(r) for r in running],
             "kv_utilization": scheduler.kv_cache_manager.usage,
             "pause_state": scheduler._pause_state.name,
         }
 
+    def _request_meta(self, request: Any) -> dict[str, Any]:
+        info: dict[str, Any] = {
+            "request_id": request.request_id,
+            "input_length": request.num_prompt_tokens,
+            "num_computed_tokens": request.num_computed_tokens,
+            "num_output_tokens": request.num_output_tokens,
+        }
+        th = request.trace_headers
+        if th:
+            conversation_id = th.get("x-shark-conversation-id")
+            turn_index = th.get("x-shark-turn-index")
+            if conversation_id is not None:
+                info["conversation_id"] = conversation_id
+                info["trace_row"] = conversation_id
+            if turn_index is not None:
+                info["turn_index"] = turn_index
+            if conversation_id is not None and turn_index is not None:
+                info["action_tape_id"] = (
+                    f"conv:{conversation_id}:turn:{turn_index}"
+                )
+            for key, target in (
+                ("x-shark-trace-timestamp-ms", "trace_timestamp_ms"),
+                ("x-shark-output-length", "output_length"),
+            ):
+                if key in th:
+                    info[target] = th[key]
+        return info
 
-def load_action_tape(path: str | os.PathLike[str]) -> dict[int, TickAction]:
-    tape_path = Path(path)
-    payload = json.loads(tape_path.read_text(encoding="utf-8"))
+
+def load_action_tape_data(payload: Any) -> dict[int, TickAction]:
+    """Parse an already-loaded JSON value into a tick-action map."""
     if isinstance(payload, dict):
         items = payload.get("ticks")
         if not isinstance(items, list):
@@ -181,3 +250,9 @@ def load_action_tape(path: str | os.PathLike[str]) -> dict[int, TickAction]:
             raise ValueError(f"Duplicate action for tick {action.tick}")
         actions[action.tick] = action
     return actions
+
+
+def load_action_tape(path: str | os.PathLike[str]) -> dict[int, TickAction]:
+    tape_path = Path(path)
+    payload = json.loads(tape_path.read_text(encoding="utf-8"))
+    return load_action_tape_data(payload)

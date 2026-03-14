@@ -1,25 +1,25 @@
-"""Benchmark: start vLLM with custom scheduler, replay Mooncake traces via aiperf.
+"""Replay Mooncake traces against a running vLLM server via AIPerf.
+
+Assumes the server is already running (see setup.py). The scheduler
+auto-reloads the action tape when it detects the file has changed,
+so just overwrite the tape file and re-run this script.
 
 Usage:
-    source vllm-venv/bin/activate
-    python benchmark.py                                    # one-command toolagent benchmark
+    python benchmark.py                                    # default: toolagent trace, 60s window
     python benchmark.py --trace synthetic                  # synthetic trace
-    python benchmark.py --trace conversation               # conversation trace
-    python benchmark.py --schedule-window 30000            # 30s trace window (shorter run)
-    python benchmark.py --goodput time_to_first_token:2000 # custom goodput SLO
-    python benchmark.py --no-custom-scheduler              # compare against default scheduler
-    python benchmark.py --server-already-running           # skip server start/stop
+    python benchmark.py --schedule-window 10000            # 10s window (faster iteration)
+    python benchmark.py --goodput time_to_first_token:1200 # custom goodput SLO
 """
 
 import argparse
 import json
-import os
-import signal
-import subprocess
 import sys
-import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
+
+from schedulers.action_tape import load_action_tape_data
 
 # ---------------------------------------------------------------------------
 # Config
@@ -27,7 +27,6 @@ from pathlib import Path
 MODEL = "cyankiwi/Qwen3.5-9B-AWQ-4bit"
 BASE_URL = "http://localhost:8000"
 MAX_MODEL_LEN = 8192
-SCHEDULER_CLS = "schedulers.custom.CustomScheduler"
 TRACE_DIR = Path(__file__).parent / "mooncake-traces"
 
 TRACES = {
@@ -37,118 +36,139 @@ TRACES = {
 }
 
 DEFAULT_GOODPUT = [
-    "time_to_first_token:2000",
+    "time_to_first_token:5000",
 ]
 DEFAULT_TRACE = "toolagent"
+DEFAULT_RANDOM_SEED = 0
 # 60s trace window: ~238 requests arriving over 60s, processing tail ≈ 4 min → ~5 min total
 DEFAULT_SCHEDULE_END_OFFSET = 60000
-ACTION_TAPE_ENV_VAR = "SHARK_ACTION_TAPE_PATH"
-ACTION_TAPE_LOG_ENV_VAR = "SHARK_ACTION_TAPE_LOG_PATH"
 
 
 # ---------------------------------------------------------------------------
-# Server management
+# AIPerf monkey-patch: inject X-Shark-* trace metadata headers
 # ---------------------------------------------------------------------------
-def wait_for_server(timeout: int = 300) -> bool:
-    import urllib.request
-    import urllib.error
+def _patch_aiperf_headers():
+    from aiperf.endpoints.base_endpoint import BaseEndpoint
 
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    _orig = BaseEndpoint.get_endpoint_headers
+
+    def _patched(self, request_info):
+        headers = _orig(self, request_info)
+        headers["X-Shark-Conversation-ID"] = str(request_info.conversation_id)
+        headers["X-Shark-Turn-Index"] = str(request_info.turn_index)
+        if request_info.turns:
+            turn = request_info.turns[request_info.turn_index]
+            if turn.timestamp is not None:
+                headers["X-Shark-Trace-Timestamp-Ms"] = str(int(turn.timestamp))
+            if turn.max_tokens is not None:
+                headers["X-Shark-Output-Length"] = str(turn.max_tokens)
+        return headers
+
+    BaseEndpoint.get_endpoint_headers = _patched
+
+
+def _validate_tape_file(tape_path: Path) -> None:
+    if not tape_path.exists():
+        print(f"ERROR: tape file not found: {tape_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        payload = json.loads(tape_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(
+            f"ERROR: invalid JSON in {tape_path}: line {exc.lineno}, "
+            f"column {exc.colno}: {exc.msg}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        load_action_tape_data(payload)
+    except ValueError as exc:
+        print(f"ERROR: invalid tape format in {tape_path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _post_tape_reset(tape_path: Path, control_port: int) -> None:
+    """POST the tape JSON to the control server's /reset endpoint."""
+    tape_data = tape_path.read_bytes()
+    url = f"http://localhost:{control_port}/reset"
+
+    for attempt in range(10):
         try:
-            req = urllib.request.Request(f"{BASE_URL}/health")
-            with urllib.request.urlopen(req, timeout=5):
-                return True
+            req = urllib.request.Request(
+                url, data=tape_data, method="POST",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                if resp.status == 200:
+                    print(f"Tape reset OK ({tape_path})")
+                    return
+                print(f"WARNING: /reset returned {resp.status}")
+                return
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode(errors="replace")
+            print(f"ERROR: /reset returned {exc.code}: {body}", file=sys.stderr)
+            sys.exit(1)
         except (urllib.error.URLError, OSError):
-            time.sleep(2)
-    return False
+            if attempt < 9:
+                time.sleep(1)
+                continue
+            print(
+                f"ERROR: could not reach control server at {url} after retries",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
 
-def start_server(
-    use_custom_scheduler: bool,
-    *,
-    action_tape_path: str | None = None,
-    action_tape_log_path: str | None = None,
-) -> subprocess.Popen:
-    cmd = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", MODEL,
-        "--host", "0.0.0.0",
-        "--port", "8000",
-        "--dtype", "half",
-        "--max-model-len", str(MAX_MODEL_LEN),
-        "--gpu-memory-utilization", "0.90",
-    ]
-    if use_custom_scheduler:
-        cmd.extend(["--scheduler-cls", SCHEDULER_CLS])
-
-    env = os.environ.copy()
-    project_dir = os.path.dirname(os.path.abspath(__file__))
-    env["PYTHONPATH"] = project_dir + os.pathsep + env.get("PYTHONPATH", "")
-    if use_custom_scheduler:
-        if not action_tape_path:
-            raise ValueError("action_tape_path is required when using the custom scheduler")
-        env[ACTION_TAPE_ENV_VAR] = action_tape_path
-        if action_tape_log_path:
-            env[ACTION_TAPE_LOG_ENV_VAR] = action_tape_log_path
-
-    print(f"Starting vLLM server (custom_scheduler={use_custom_scheduler})...")
-    print(f"  Command: {' '.join(cmd)}")
-    if use_custom_scheduler:
-        print(f"  {ACTION_TAPE_ENV_VAR}={action_tape_path}")
-        if action_tape_log_path:
-            print(f"  {ACTION_TAPE_LOG_ENV_VAR}={action_tape_log_path}")
-    proc = subprocess.Popen(
-        cmd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    return proc
-
-
-def stop_server(proc: subprocess.Popen):
-    if proc.poll() is None:
-        print("\nStopping server...")
-        proc.send_signal(signal.SIGINT)
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-
-
-def create_temp_noop_tape() -> str:
-    handle = tempfile.NamedTemporaryFile(
-        mode="w",
-        prefix="shark-noop-action-tape-",
-        suffix=".json",
-        delete=False,
-    )
-    with handle:
-        json.dump({"ticks": []}, handle)
-    return handle.name
+def _run_aiperf_inprocess(aiperf_args: list[str]):
+    _patch_aiperf_headers()
+    saved_argv = sys.argv
+    try:
+        sys.argv = ["aiperf"] + aiperf_args
+        from aiperf.cli import app
+        app()
+    finally:
+        sys.argv = saved_argv
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark vLLM with Mooncake traces via aiperf")
-    parser.add_argument("--trace", choices=list(TRACES.keys()), default=DEFAULT_TRACE,
-                        help=f"Which trace to replay (default: {DEFAULT_TRACE})")
-    parser.add_argument("--schedule-window", type=int, default=DEFAULT_SCHEDULE_END_OFFSET,
-                        help=f"Trace time window in ms (default: {DEFAULT_SCHEDULE_END_OFFSET})")
-    parser.add_argument("--max-model-len", type=int, default=MAX_MODEL_LEN,
-                        help=f"Filter requests exceeding this (default: {MAX_MODEL_LEN})")
-    parser.add_argument("--no-custom-scheduler", action="store_true",
-                        help="Use default scheduler instead of the custom scheduler")
-    parser.add_argument("--server-already-running", action="store_true",
-                        help="Skip starting/stopping server and target an existing server")
-    parser.add_argument("--action-tape", type=str, default=None,
-                        help="Action tape JSON to load when using the custom scheduler")
-    parser.add_argument("--action-tape-log", type=str, default=None,
-                        help="Optional replay log path to set via SHARK_ACTION_TAPE_LOG_PATH")
+    parser = argparse.ArgumentParser(
+        description="Replay Mooncake traces against a running vLLM server"
+    )
+    parser.add_argument(
+        "--trace",
+        choices=list(TRACES.keys()),
+        default=DEFAULT_TRACE,
+        help=f"Which trace to replay (default: {DEFAULT_TRACE})",
+    )
+    parser.add_argument(
+        "--schedule-window",
+        type=int,
+        default=DEFAULT_SCHEDULE_END_OFFSET,
+        help=f"Trace time window in ms (default: {DEFAULT_SCHEDULE_END_OFFSET})",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=MAX_MODEL_LEN,
+        help=f"Filter requests exceeding this input length (default: {MAX_MODEL_LEN})",
+    )
+    parser.add_argument(
+        "--action-tape",
+        default="tape.json",
+        help="Path to action tape JSON file. POSTs the tape to the "
+             "control server before starting the replay (default: tape.json).",
+    )
+    parser.add_argument(
+        "--control-port",
+        type=int,
+        default=8001,
+        help="Port of the scheduler control server (default: 8001)",
+    )
     parser.add_argument(
         "--goodput",
         nargs="+",
@@ -156,83 +176,44 @@ def main():
         default=None,
         help=(
             "Override the default AIPerf goodput SLOs. "
-            "Default: time_to_first_token:2000. "
+            "Default: time_to_first_token:5000. "
             "Example: --goodput time_to_first_token:1200 inter_token_latency:25"
         ),
     )
     args = parser.parse_args()
 
     trace_path = TRACES[args.trace]
-    use_custom = not args.no_custom_scheduler
     effective_goodput = args.goodput or DEFAULT_GOODPUT
-    proc = None
-    temp_tape_path = None
 
-    action_tape_path = args.action_tape or os.environ.get(ACTION_TAPE_ENV_VAR)
-    action_tape_log_path = args.action_tape_log or os.environ.get(ACTION_TAPE_LOG_ENV_VAR)
+    print(f"Trace: {args.trace}  |  Window: {args.schedule_window}ms")
+    print(f"AIPerf random seed: {DEFAULT_RANDOM_SEED}")
+    print(f"Goodput SLOs: {' '.join(effective_goodput)}\n")
 
-    if use_custom and not args.server_already_running and not action_tape_path:
-        temp_tape_path = create_temp_noop_tape()
-        action_tape_path = temp_tape_path
+    aiperf_args = [
+        "profile",
+        "--model", MODEL,
+        "--url", BASE_URL,
+        "--endpoint-type", "chat",
+        "--tokenizer", MODEL,
+        "--streaming",
+        "--custom-dataset-type", "mooncake-trace",
+        "--input-file", str(trace_path),
+        "--random-seed", str(DEFAULT_RANDOM_SEED),
+        "--synthesis-max-isl", str(args.max_model_len),
+        "--fixed-schedule",
+        "--fixed-schedule-auto-offset",
+        "--fixed-schedule-end-offset", str(args.schedule_window),
+        "--extra-inputs", "ignore_eos:true",
+        "--goodput", *effective_goodput,
+    ]
 
-    try:
-        # Start server
-        if not args.server_already_running:
-            proc = start_server(
-                use_custom,
-                action_tape_path=action_tape_path,
-                action_tape_log_path=action_tape_log_path,
-            )
-            print("Waiting for server to be ready...")
-            if not wait_for_server():
-                print("ERROR: Server failed to start. Last output:")
-                if proc.stdout:
-                    print(proc.stdout.read().decode()[-3000:])
-                sys.exit(1)
-            print("Server ready!\n")
-        else:
-            print("Using already-running server\n")
-            if use_custom and action_tape_path:
-                print(
-                    "Note: --action-tape / SHARK_ACTION_TAPE_PATH is not applied when "
-                    "--server-already-running is used."
-                )
+    if args.action_tape:
+        tape_path = Path(args.action_tape)
+        _validate_tape_file(tape_path)
+        _post_tape_reset(tape_path, args.control_port)
 
-        # Build aiperf command
-        scheduler_name = SCHEDULER_CLS if use_custom else "default"
-        print(f"Trace: {args.trace}  |  Scheduler: {scheduler_name}")
-        print(f"Schedule window: {args.schedule_window}ms")
-        if use_custom and action_tape_path and not args.server_already_running:
-            print(f"Action tape: {action_tape_path}")
-        if use_custom and action_tape_log_path and not args.server_already_running:
-            print(f"Action tape log: {action_tape_log_path}")
-        print(f"Goodput SLOs: {' '.join(effective_goodput)}\n")
-
-        aiperf_cmd = [
-            sys.executable, "-m", "aiperf", "profile",
-            "--model", MODEL,
-            "--url", BASE_URL,
-            "--endpoint-type", "chat",
-            "--tokenizer", MODEL,
-            "--streaming",
-            "--custom-dataset-type", "mooncake-trace",
-            "--input-file", str(trace_path),
-            "--synthesis-max-isl", str(args.max_model_len),
-            "--fixed-schedule",
-            "--fixed-schedule-auto-offset",
-            "--fixed-schedule-end-offset", str(args.schedule_window),
-            "--extra-inputs", "ignore_eos:true",
-            "--goodput", *effective_goodput,
-        ]
-
-        print(f"Running: {' '.join(aiperf_cmd)}\n")
-        subprocess.run(aiperf_cmd)
-
-    finally:
-        if proc is not None:
-            stop_server(proc)
-        if temp_tape_path is not None:
-            Path(temp_tape_path).unlink(missing_ok=True)
+    print(f"Running: aiperf {' '.join(aiperf_args)}\n")
+    _run_aiperf_inprocess(aiperf_args)
 
 
 if __name__ == "__main__":

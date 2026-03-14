@@ -1,8 +1,15 @@
 """Custom vLLM scheduler for experimentation."""
 
+import json
+import logging
+import os
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Iterable
 
-from schedulers.action_tape import ActionTapeRuntime, TickAction
+from schedulers.action_tape import ActionTapeRuntime, TickAction, load_action_tape_data
+
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -14,11 +21,97 @@ from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
+logger = logging.getLogger(__name__)
+
+
+class _ControlHandler(BaseHTTPRequestHandler):
+    """HTTP handler for the scheduler control server."""
+
+    scheduler: "CustomScheduler"
+
+    def do_POST(self):
+        if self.path != "/reset":
+            self.send_error(404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            payload = json.loads(body)
+            tape = load_action_tape_data(payload)
+        except Exception as exc:
+            self.send_response(400)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(f"Bad tape JSON: {exc}\n".encode())
+            return
+
+        sched = self.scheduler
+        if sched._can_apply_reset_immediately():
+            sched._apply_reset(tape)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK\n")
+            return
+
+        sched._pending_tape = tape
+        sched._reset_done.clear()
+        sched._reset_requested.set()
+
+        if sched._reset_done.wait(timeout=30):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK\n")
+        else:
+            self.send_response(504)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Timeout waiting for schedule() to apply reset\n")
+
+    def do_GET(self):
+        if self.path != "/health":
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK\n")
+
+    def log_message(self, format, *args):
+        logger.debug("control: %s", format % args)
+
 
 class CustomScheduler(Scheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._action_tape = ActionTapeRuntime.from_env()
+        self._scheduler_tick = 0
+
+        self._reset_requested = threading.Event()
+        self._reset_done = threading.Event()
+        self._pending_tape: dict[int, TickAction] | None = None
+
+        control_port = int(os.environ.get("SHARK_CONTROL_PORT", "8001"))
+        handler = type(
+            "_BoundHandler",
+            (_ControlHandler,),
+            {"scheduler": self},
+        )
+        self._control_server = HTTPServer(("0.0.0.0", control_port), handler)
+        thread = threading.Thread(
+            target=self._control_server.serve_forever,
+            daemon=True,
+        )
+        thread.start()
+        logger.info("Control server listening on :%d", control_port)
+
+    def _can_apply_reset_immediately(self) -> bool:
+        return not self.running and not self.waiting
+
+    def _apply_reset(self, tape: dict[int, TickAction]) -> None:
+        self._action_tape.reset_from_data(tape)
+        self._pending_tape = None
         self._scheduler_tick = 0
 
     def _record_ignored_action(
@@ -44,8 +137,9 @@ class CustomScheduler(Scheduler):
         *,
         kind: str,
     ) -> list[Request]:
-        running_by_id = {request.request_id: request for request in self.running}
+        running_by_id = self._request_alias_map(self.running)
         preempted: list[Request] = []
+        seen_request_ids: set[str] = set()
         for request_id in request_ids:
             request = running_by_id.get(request_id)
             if request is None:
@@ -56,10 +150,12 @@ class CustomScheduler(Scheduler):
                     reason="request is not running on this tick",
                 )
                 continue
+            if request.request_id in seen_request_ids:
+                continue
             self.running.remove(request)
             self._preempt_request(request, timestamp)
             preempted.append(request)
-            running_by_id.pop(request_id, None)
+            seen_request_ids.add(request.request_id)
         return preempted
 
     def _force_evict_requests(
@@ -68,9 +164,11 @@ class CustomScheduler(Scheduler):
         timestamp: float,
         record: dict[str, object],
     ) -> list[Request]:
+        active_by_id = self._request_alias_map(self.requests.values())
         evicted_running: list[Request] = []
+        seen_request_ids: set[str] = set()
         for request_id in request_ids:
-            request = self.requests.get(request_id)
+            request = active_by_id.get(request_id)
             if request is None or request.is_finished():
                 self._record_ignored_action(
                     record,
@@ -79,6 +177,9 @@ class CustomScheduler(Scheduler):
                     reason="request is not active",
                 )
                 continue
+            if request.request_id in seen_request_ids:
+                continue
+            seen_request_ids.add(request.request_id)
 
             if request.status == RequestStatus.RUNNING:
                 if request in self.running:
@@ -105,6 +206,52 @@ class CustomScheduler(Scheduler):
                 request.spec_token_ids = []
         return evicted_running
 
+    def _request_tape_alias(self, request: Request) -> str | None:
+        trace_headers = request.trace_headers or {}
+        conversation_id = trace_headers.get("x-shark-conversation-id")
+        turn_index = trace_headers.get("x-shark-turn-index")
+        if conversation_id is None or turn_index is None:
+            return None
+        return f"conv:{conversation_id}:turn:{turn_index}"
+
+    def _request_aliases(self, request: Request) -> tuple[str, ...]:
+        aliases = [request.request_id]
+        tape_alias = self._request_tape_alias(request)
+        if tape_alias is not None:
+            aliases.append(tape_alias)
+        return tuple(aliases)
+
+    def _request_alias_map(self, requests: Iterable[Request]) -> dict[str, Request]:
+        alias_map: dict[str, Request] = {}
+        for request in requests:
+            for alias in self._request_aliases(request):
+                alias_map.setdefault(alias, request)
+        return alias_map
+
+    def _resolve_request_order(
+        self,
+        requests: list[Request],
+        targets: list[str],
+        record: dict[str, object],
+        *,
+        kind: str,
+        missing_reason: str,
+    ) -> dict[str, int]:
+        alias_map = self._request_alias_map(requests)
+        requested_order: dict[str, int] = {}
+        for index, target in enumerate(targets):
+            request = alias_map.get(target)
+            if request is None:
+                self._record_ignored_action(
+                    record,
+                    kind=kind,
+                    request_id=target,
+                    reason=missing_reason,
+                )
+                continue
+            requested_order.setdefault(request.request_id, index)
+        return requested_order
+
     def _order_running_requests(
         self,
         action: TickAction,
@@ -113,23 +260,17 @@ class CustomScheduler(Scheduler):
         current_order = {
             request.request_id: index for index, request in enumerate(self.running)
         }
-        requested_order = {
-            request_id: index for index, request_id in enumerate(action.decode_priority)
-        }
-        for request_id in action.decode_priority:
-            if request_id not in current_order:
-                self._record_ignored_action(
-                    record,
-                    kind="decode_priority",
-                    request_id=request_id,
-                    reason="request is not running on this tick",
-                )
-        self.running.sort(
-            key=lambda request: (
-                requested_order.get(request.request_id, len(requested_order)),
-                current_order[request.request_id],
-            )
+        requested_order = self._resolve_request_order(
+            list(self.running),
+            action.decode_priority,
+            record,
+            kind="decode_priority",
+            missing_reason="request is not running on this tick",
         )
+        self.running.sort(key=lambda request: (
+            requested_order.get(request.request_id, len(action.decode_priority)),
+            current_order[request.request_id],
+        ))
 
     def _rebuild_waiting_queue(self, ordered_requests: list[Request]) -> None:
         rebuilt_waiting = create_request_queue(self.policy)
@@ -141,32 +282,27 @@ class CustomScheduler(Scheduler):
         self,
         action: TickAction,
         record: dict[str, object],
-    ) -> None:
+    ) -> set[str]:
         waiting_requests = list(self.waiting)
         if not waiting_requests:
-            return
+            return set()
 
         current_order = {
             request.request_id: index for index, request in enumerate(waiting_requests)
         }
-        requested_order = {
-            request_id: index for index, request_id in enumerate(action.admit)
-        }
-        for request_id in action.admit:
-            if request_id not in current_order:
-                self._record_ignored_action(
-                    record,
-                    kind="admit",
-                    request_id=request_id,
-                    reason="request is not waiting on this tick",
-                )
-        waiting_requests.sort(
-            key=lambda request: (
-                requested_order.get(request.request_id, len(requested_order)),
-                current_order[request.request_id],
-            )
+        requested_order = self._resolve_request_order(
+            waiting_requests,
+            action.admit,
+            record,
+            kind="admit",
+            missing_reason="request is not waiting on this tick",
         )
+        waiting_requests.sort(key=lambda request: (
+            requested_order.get(request.request_id, len(action.admit)),
+            current_order[request.request_id],
+        ))
         self._rebuild_waiting_queue(waiting_requests)
+        return set(requested_order)
 
     def _apply_prefill_chunk_action(
         self,
@@ -182,6 +318,12 @@ class CustomScheduler(Scheduler):
         return min(num_new_tokens, action.prefill_chunk_tokens)
 
     def schedule(self) -> SchedulerOutput:
+        if self._reset_requested.is_set():
+            self._apply_reset(self._pending_tape)
+            self._reset_requested.clear()
+            self._reset_done.set()
+        elif self._action_tape.maybe_reload():
+            self._scheduler_tick = 0
         tick = self._scheduler_tick
         self._scheduler_tick += 1
         action = self._action_tape.action_for_tick(tick)
@@ -365,7 +507,7 @@ class CustomScheduler(Scheduler):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         if self._pause_state == PauseState.UNPAUSED and action.admit:
-            self._order_waiting_requests(action, record)
+            allowed_request_ids = self._order_waiting_requests(action, record)
 
             skipped_waiting_requests = create_request_queue(self.policy)
 
@@ -375,6 +517,11 @@ class CustomScheduler(Scheduler):
 
                 request = self.waiting.peek_request()
                 request_id = request.request_id
+
+                if request_id not in allowed_request_ids:
+                    request = self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    continue
 
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
