@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DEFAULT_MODEL_ID="Qwen/Qwen3.5-35B-A3B"
+ALT_MODEL_ID="Qwen/Qwen3-14B"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${VENV_DIR:-$ROOT_DIR/vllm-venv}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-35B-A3B}"
-MODEL_DIR="${MODEL_DIR:-$ROOT_DIR/models/Qwen3.5-35B-A3B}"
+MODEL_ID="${MODEL_ID:-$DEFAULT_MODEL_ID}"
 VLLM_REPO_URL="${VLLM_REPO_URL:-https://github.com/vllm-project/vllm.git}"
 VLLM_COMMIT="${VLLM_COMMIT:-95c0f928cdeeaa21c4906e73cee6a156e1b3b995}"
 APT_PACKAGES=(
@@ -21,6 +22,36 @@ APT_PACKAGES=(
   python3-venv
   ripgrep
 )
+
+usage() {
+  cat <<'EOF'
+Usage: ./setup.sh [--h100] [--help]
+
+Options:
+  --h100                  Download Qwen/Qwen3-14B instead of the default Qwen/Qwen3.5-35B-A3B
+  --help                  Show this help text
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --h100)
+      MODEL_ID="$ALT_MODEL_ID"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+MODEL_DIR="${MODEL_DIR:-$ROOT_DIR/models/${MODEL_ID##*/}}"
 
 run_as_root() {
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -84,8 +115,9 @@ VENV_PY="$VENV_DIR/bin/python"
 echo
 echo "Installing Python packages..."
 uv pip install --python "$VENV_PY" -U pip setuptools wheel
+uv pip install --python "$VENV_PY" -U hf_transfer
 uv pip install --python "$VENV_PY" -U \
-  "huggingface-hub[cli,hf_transfer]" \
+  "huggingface-hub[cli]" \
   aiperf \
   nvidia-ml-py
 
@@ -93,6 +125,9 @@ if ! need_cmd claude; then
   echo
   echo "Installing Claude Code..."
   curl -fsSL https://claude.ai/install.sh | bash
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+  # shellcheck disable=SC1090
+  source ~/.bashrc
 fi
 
 echo
