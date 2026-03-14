@@ -7,8 +7,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${VENV_DIR:-$ROOT_DIR/vllm-venv}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 MODEL_ID="${MODEL_ID:-$DEFAULT_MODEL_ID}"
+TRACE_BASE_URL="${TRACE_BASE_URL:-https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces}"
 VLLM_REPO_URL="${VLLM_REPO_URL:-https://github.com/vllm-project/vllm.git}"
-VLLM_COMMIT="${VLLM_COMMIT:-95c0f928cdeeaa21c4906e73cee6a156e1b3b995}"
+VLLM_REF="${VLLM_REF:-main}"
 APT_PACKAGES=(
   build-essential
   ca-certificates
@@ -65,12 +66,10 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
-if [[ ! -d "$ROOT_DIR/vllm/.git" ]]; then
-  echo
-  echo "Cloning vLLM into $ROOT_DIR/vllm..."
-  git clone "$VLLM_REPO_URL" "$ROOT_DIR/vllm"
-  git -C "$ROOT_DIR/vllm" checkout "$VLLM_COMMIT"
-fi
+echo
+echo "Refreshing vLLM checkout in $ROOT_DIR/vllm..."
+rm -rf "$ROOT_DIR/vllm"
+git clone --depth 1 --branch "$VLLM_REF" "$VLLM_REPO_URL" "$ROOT_DIR/vllm"
 
 if ! need_cmd nvidia-smi; then
   echo "nvidia-smi not found. Install the NVIDIA driver first, then re-run setup.sh." >&2
@@ -139,6 +138,17 @@ if ! VLLM_USE_PRECOMPILED=1 uv pip install --python "$VENV_PY" --editable .; the
     uv pip install --python "$VENV_PY" --editable .
 fi
 popd >/dev/null
+
+TRACE_DIR="$ROOT_DIR/mooncake-traces"
+mkdir -p "$TRACE_DIR"
+
+echo
+echo "Downloading Mooncake traces into $TRACE_DIR..."
+for trace_name in conversation_trace.jsonl synthetic_trace.jsonl toolagent_trace.jsonl; do
+  curl -fL --retry 3 --retry-delay 2 \
+    "$TRACE_BASE_URL/$trace_name" \
+    -o "$TRACE_DIR/$trace_name"
+done
 
 echo
 echo "Downloading model $MODEL_ID into $MODEL_DIR..."
