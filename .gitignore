@@ -13,6 +13,9 @@ vllm-venv/
 .venv/
 venv/
 
+# Local dependency checkout
+vllm/
+
 # Models (large files)
 models/
 
