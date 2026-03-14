@@ -2,7 +2,7 @@
 
 Usage:
     source vllm-venv/bin/activate
-    python benchmark.py                                    # 60s trace window ≈ 5 min benchmark
+    python benchmark.py                                    # one-command toolagent benchmark
     python benchmark.py --trace synthetic                  # synthetic trace
     python benchmark.py --trace conversation               # conversation trace
     python benchmark.py --schedule-window 30000            # 30s trace window (shorter run)
@@ -12,10 +12,12 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -40,6 +42,8 @@ DEFAULT_GOODPUT = [
 DEFAULT_TRACE = "toolagent"
 # 60s trace window: ~238 requests arriving over 60s, processing tail ≈ 4 min → ~5 min total
 DEFAULT_SCHEDULE_END_OFFSET = 60000
+ACTION_TAPE_ENV_VAR = "SHARK_ACTION_TAPE_PATH"
+ACTION_TAPE_LOG_ENV_VAR = "SHARK_ACTION_TAPE_LOG_PATH"
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +64,12 @@ def wait_for_server(timeout: int = 300) -> bool:
     return False
 
 
-def start_server(use_custom_scheduler: bool) -> subprocess.Popen:
+def start_server(
+    use_custom_scheduler: bool,
+    *,
+    action_tape_path: str | None = None,
+    action_tape_log_path: str | None = None,
+) -> subprocess.Popen:
     cmd = [
         sys.executable, "-m", "vllm.entrypoints.openai.api_server",
         "--model", MODEL,
@@ -76,9 +85,19 @@ def start_server(use_custom_scheduler: bool) -> subprocess.Popen:
     env = os.environ.copy()
     project_dir = os.path.dirname(os.path.abspath(__file__))
     env["PYTHONPATH"] = project_dir + os.pathsep + env.get("PYTHONPATH", "")
+    if use_custom_scheduler:
+        if not action_tape_path:
+            raise ValueError("action_tape_path is required when using the custom scheduler")
+        env[ACTION_TAPE_ENV_VAR] = action_tape_path
+        if action_tape_log_path:
+            env[ACTION_TAPE_LOG_ENV_VAR] = action_tape_log_path
 
     print(f"Starting vLLM server (custom_scheduler={use_custom_scheduler})...")
     print(f"  Command: {' '.join(cmd)}")
+    if use_custom_scheduler:
+        print(f"  {ACTION_TAPE_ENV_VAR}={action_tape_path}")
+        if action_tape_log_path:
+            print(f"  {ACTION_TAPE_LOG_ENV_VAR}={action_tape_log_path}")
     proc = subprocess.Popen(
         cmd,
         env=env,
@@ -99,6 +118,18 @@ def stop_server(proc: subprocess.Popen):
             proc.wait()
 
 
+def create_temp_noop_tape() -> str:
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix="shark-noop-action-tape-",
+        suffix=".json",
+        delete=False,
+    )
+    with handle:
+        json.dump({"ticks": []}, handle)
+    return handle.name
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -113,8 +144,11 @@ def main():
     parser.add_argument("--no-custom-scheduler", action="store_true",
                         help="Use default scheduler instead of the custom scheduler")
     parser.add_argument("--server-already-running", action="store_true",
-                        default=True,
-                        help="Skip starting/stopping server (default: True)")
+                        help="Skip starting/stopping server and target an existing server")
+    parser.add_argument("--action-tape", type=str, default=None,
+                        help="Action tape JSON to load when using the custom scheduler")
+    parser.add_argument("--action-tape-log", type=str, default=None,
+                        help="Optional replay log path to set via SHARK_ACTION_TAPE_LOG_PATH")
     parser.add_argument(
         "--goodput",
         nargs="+",
@@ -132,11 +166,23 @@ def main():
     use_custom = not args.no_custom_scheduler
     effective_goodput = args.goodput or DEFAULT_GOODPUT
     proc = None
+    temp_tape_path = None
+
+    action_tape_path = args.action_tape or os.environ.get(ACTION_TAPE_ENV_VAR)
+    action_tape_log_path = args.action_tape_log or os.environ.get(ACTION_TAPE_LOG_ENV_VAR)
+
+    if use_custom and not args.server_already_running and not action_tape_path:
+        temp_tape_path = create_temp_noop_tape()
+        action_tape_path = temp_tape_path
 
     try:
         # Start server
         if not args.server_already_running:
-            proc = start_server(use_custom)
+            proc = start_server(
+                use_custom,
+                action_tape_path=action_tape_path,
+                action_tape_log_path=action_tape_log_path,
+            )
             print("Waiting for server to be ready...")
             if not wait_for_server():
                 print("ERROR: Server failed to start. Last output:")
@@ -146,11 +192,20 @@ def main():
             print("Server ready!\n")
         else:
             print("Using already-running server\n")
+            if use_custom and action_tape_path:
+                print(
+                    "Note: --action-tape / SHARK_ACTION_TAPE_PATH is not applied when "
+                    "--server-already-running is used."
+                )
 
         # Build aiperf command
         scheduler_name = SCHEDULER_CLS if use_custom else "default"
         print(f"Trace: {args.trace}  |  Scheduler: {scheduler_name}")
         print(f"Schedule window: {args.schedule_window}ms")
+        if use_custom and action_tape_path and not args.server_already_running:
+            print(f"Action tape: {action_tape_path}")
+        if use_custom and action_tape_log_path and not args.server_already_running:
+            print(f"Action tape log: {action_tape_log_path}")
         print(f"Goodput SLOs: {' '.join(effective_goodput)}\n")
 
         aiperf_cmd = [
@@ -176,6 +231,8 @@ def main():
     finally:
         if proc is not None:
             stop_server(proc)
+        if temp_tape_path is not None:
+            Path(temp_tape_path).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

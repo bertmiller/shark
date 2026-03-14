@@ -2,6 +2,7 @@
 
 import time
 
+from schedulers.action_tape import ActionTapeRuntime, TickAction
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -15,7 +16,177 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 
 class CustomScheduler(Scheduler):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._action_tape = ActionTapeRuntime.from_env()
+        self._scheduler_tick = 0
+
+    def _record_ignored_action(
+        self,
+        record: dict[str, object],
+        *,
+        kind: str,
+        request_id: str,
+        reason: str,
+    ) -> None:
+        self._action_tape.record_ignored_action(
+            record,
+            kind=kind,
+            request_id=request_id,
+            reason=reason,
+        )
+
+    def _force_preempt_requests(
+        self,
+        request_ids: list[str],
+        timestamp: float,
+        record: dict[str, object],
+        *,
+        kind: str,
+    ) -> list[Request]:
+        running_by_id = {request.request_id: request for request in self.running}
+        preempted: list[Request] = []
+        for request_id in request_ids:
+            request = running_by_id.get(request_id)
+            if request is None:
+                self._record_ignored_action(
+                    record,
+                    kind=kind,
+                    request_id=request_id,
+                    reason="request is not running on this tick",
+                )
+                continue
+            self.running.remove(request)
+            self._preempt_request(request, timestamp)
+            preempted.append(request)
+            running_by_id.pop(request_id, None)
+        return preempted
+
+    def _force_evict_requests(
+        self,
+        request_ids: list[str],
+        timestamp: float,
+        record: dict[str, object],
+    ) -> list[Request]:
+        evicted_running: list[Request] = []
+        for request_id in request_ids:
+            request = self.requests.get(request_id)
+            if request is None or request.is_finished():
+                self._record_ignored_action(
+                    record,
+                    kind="evict",
+                    request_id=request_id,
+                    reason="request is not active",
+                )
+                continue
+
+            if request.status == RequestStatus.RUNNING:
+                if request in self.running:
+                    self.running.remove(request)
+                self._preempt_request(request, timestamp)
+                evicted_running.append(request)
+                continue
+
+            if request.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+                self._record_ignored_action(
+                    record,
+                    kind="evict",
+                    request_id=request_id,
+                    reason=f"request is in unsupported state {request.status.name}",
+                )
+                continue
+
+            self.kv_cache_manager.free(request)
+            self.encoder_cache_manager.free(request)
+            request.num_computed_tokens = 0
+            request.num_cached_tokens = -1
+            request.num_external_computed_tokens = 0
+            if request.spec_token_ids:
+                request.spec_token_ids = []
+        return evicted_running
+
+    def _order_running_requests(
+        self,
+        action: TickAction,
+        record: dict[str, object],
+    ) -> None:
+        current_order = {
+            request.request_id: index for index, request in enumerate(self.running)
+        }
+        requested_order = {
+            request_id: index for index, request_id in enumerate(action.decode_priority)
+        }
+        for request_id in action.decode_priority:
+            if request_id not in current_order:
+                self._record_ignored_action(
+                    record,
+                    kind="decode_priority",
+                    request_id=request_id,
+                    reason="request is not running on this tick",
+                )
+        self.running.sort(
+            key=lambda request: (
+                requested_order.get(request.request_id, len(requested_order)),
+                current_order[request.request_id],
+            )
+        )
+
+    def _rebuild_waiting_queue(self, ordered_requests: list[Request]) -> None:
+        rebuilt_waiting = create_request_queue(self.policy)
+        for request in ordered_requests:
+            rebuilt_waiting.add_request(request)
+        self.waiting = rebuilt_waiting
+
+    def _order_waiting_requests(
+        self,
+        action: TickAction,
+        record: dict[str, object],
+    ) -> None:
+        waiting_requests = list(self.waiting)
+        if not waiting_requests:
+            return
+
+        current_order = {
+            request.request_id: index for index, request in enumerate(waiting_requests)
+        }
+        requested_order = {
+            request_id: index for index, request_id in enumerate(action.admit)
+        }
+        for request_id in action.admit:
+            if request_id not in current_order:
+                self._record_ignored_action(
+                    record,
+                    kind="admit",
+                    request_id=request_id,
+                    reason="request is not waiting on this tick",
+                )
+        waiting_requests.sort(
+            key=lambda request: (
+                requested_order.get(request.request_id, len(requested_order)),
+                current_order[request.request_id],
+            )
+        )
+        self._rebuild_waiting_queue(waiting_requests)
+
+    def _apply_prefill_chunk_action(
+        self,
+        request: Request,
+        num_new_tokens: int,
+        action: TickAction,
+    ) -> int:
+        if action.prefill_chunk_tokens is None or request.num_computed_tokens >= request.num_tokens:
+            return num_new_tokens
+
+        if action.prefill_chunk_tokens <= 0:
+            return 0
+        return min(num_new_tokens, action.prefill_chunk_tokens)
+
     def schedule(self) -> SchedulerOutput:
+        tick = self._scheduler_tick
+        self._scheduler_tick += 1
+        action = self._action_tape.action_for_tick(tick)
+        record = self._action_tape.begin_tick(self, tick, action)
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -35,16 +206,23 @@ class CustomScheduler(Scheduler):
 
         self.kv_cache_manager.new_step_starts()
 
-        # OPT 1: Sort running requests so decode (1 token) goes before
-        # ongoing prefills (thousands of tokens). This guarantees decode
-        # requests always get budget, keeping ITL low.
-        self.running.sort(
-            key=lambda r: (
-                r.num_tokens_with_spec
-                + r.num_output_placeholders
-                - r.num_computed_tokens
+        preempted_reqs.extend(
+            self._force_preempt_requests(
+                action.preempt,
+                scheduled_timestamp,
+                record,
+                kind="preempt",
             )
         )
+        preempted_reqs.extend(
+            self._force_evict_requests(
+                action.evict,
+                scheduled_timestamp,
+                record,
+            )
+        )
+
+        self._order_running_requests(action, record)
 
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -63,8 +241,11 @@ class CustomScheduler(Scheduler):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
-                num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            num_new_tokens = self._apply_prefill_chunk_action(
+                request,
+                num_new_tokens,
+                action,
+            )
             num_new_tokens = min(num_new_tokens, token_budget)
 
             num_new_tokens = min(
@@ -183,22 +364,12 @@ class CustomScheduler(Scheduler):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            # OPT 2: Sort waiting queue by remaining prefill tokens (SJF).
-            # Shorter prefills finish sooner -> faster TTFT -> more requests
-            # meet the SLO.  Long-prompt requests that can't meet the SLO
-            # anyway are deferred, giving budget to requests that can.
-            if len(self.waiting) > 1:
-                sorted_reqs = sorted(
-                    self.waiting,
-                    key=lambda r: r.num_tokens - r.num_computed_tokens,
-                )
-                self.waiting.clear()
-                self.waiting.extend(sorted_reqs)
+        if self._pause_state == PauseState.UNPAUSED and action.admit:
+            self._order_waiting_requests(action, record)
 
             skipped_waiting_requests = create_request_queue(self.policy)
 
-            while self.waiting and token_budget > 0:
+            while self.waiting and token_budget > 0 and action.prefill_chunk_tokens != 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -290,9 +461,11 @@ class CustomScheduler(Scheduler):
                     num_new_tokens = 0
                 else:
                     num_new_tokens = request.num_tokens - num_computed_tokens
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
+                    num_new_tokens = self._apply_prefill_chunk_action(
+                        request,
+                        num_new_tokens,
+                        action,
+                    )
 
                     if (
                         not self.scheduler_config.enable_chunked_prefill
@@ -301,7 +474,8 @@ class CustomScheduler(Scheduler):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
-                    assert num_new_tokens > 0
+                    if num_new_tokens == 0:
+                        break
 
                     if request.has_encoder_inputs:
                         (
@@ -501,4 +675,5 @@ class CustomScheduler(Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self._action_tape.finish_tick(record, self, scheduler_output)
         return scheduler_output
