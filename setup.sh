@@ -6,6 +6,8 @@ VENV_DIR="${VENV_DIR:-$ROOT_DIR/vllm-venv}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3.5-35B-A3B}"
 MODEL_DIR="${MODEL_DIR:-$ROOT_DIR/models/Qwen3.5-35B-A3B}"
+VLLM_REPO_URL="${VLLM_REPO_URL:-https://github.com/vllm-project/vllm.git}"
+VLLM_COMMIT="${VLLM_COMMIT:-95c0f928cdeeaa21c4906e73cee6a156e1b3b995}"
 APT_PACKAGES=(
   build-essential
   ca-certificates
@@ -32,9 +34,11 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
-if [[ ! -d "$ROOT_DIR/vllm" ]]; then
-  echo "Expected vendored vLLM checkout at $ROOT_DIR/vllm" >&2
-  exit 1
+if [[ ! -d "$ROOT_DIR/vllm/.git" ]]; then
+  echo
+  echo "Cloning vLLM into $ROOT_DIR/vllm..."
+  git clone "$VLLM_REPO_URL" "$ROOT_DIR/vllm"
+  git -C "$ROOT_DIR/vllm" checkout "$VLLM_COMMIT"
 fi
 
 if ! need_cmd nvidia-smi; then
