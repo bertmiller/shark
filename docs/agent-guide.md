@@ -6,7 +6,7 @@ You are optimizing a vLLM inference server's scheduling decisions. This guide te
 
 **Goodput** = the fraction of requests that meet their SLO.
 
-SLO: `time_to_first_token < 15000ms`. The benchmark runs AIPerf against a Mooncake trace (~238 requests arriving over 60 seconds) and reports goodput at the end.
+SLO: `time_to_first_token < 2000ms`. The benchmark runs AIPerf against a Mooncake trace (~238 requests arriving over 60 seconds) and reports goodput at the end.
 
 Your goal: produce a **sparse action tape** (JSON) that the scheduler replays, such that goodput is maximized for the full 60-second trace window (~238 requests). Build up to this incrementally — start with a few requests, get those working well, then scale up.
 
@@ -158,7 +158,7 @@ Each action entry can specify any combination of these fields. Omitted fields (o
 
 **KV cache is finite.** Watch `kv_utilization` in the replay log. When it approaches 1.0, new admissions will fail (allocation returns None). You must preempt or evict to free space before more eligible requests can be admitted. The scheduler will auto-preempt the lowest-priority running request if allocation fails, but relying on this is less controllable.
 
-**TTFT starts at request arrival, not admission.** A request's time-to-first-token clock starts when AIPerf sends it (governed by trace timestamps). Every tick the request sits in `waiting` counts against its TTFT SLO. To meet `TTFT < 15000ms`, you must make requests eligible promptly after they arrive.
+**TTFT starts at request arrival, not admission.** A request's time-to-first-token clock starts when AIPerf sends it (governed by trace timestamps). Every tick the request sits in `waiting` counts against its TTFT SLO. To meet `TTFT < 2000ms`, you must make requests eligible promptly after they arrive.
 
 ## 7. Tape Format
 

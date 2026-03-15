@@ -37,7 +37,7 @@ TRACES = {
 }
 
 DEFAULT_GOODPUT = [
-    "time_to_first_token:15000",
+    "time_to_first_token:2000",
 ]
 DEFAULT_TRACE = "toolagent"
 DEFAULT_RANDOM_SEED = 0
@@ -165,7 +165,7 @@ def main():
         default=None,
         help=(
             "Override the default AIPerf goodput SLOs. "
-            "Default: time_to_first_token:15000. "
+            "Default: time_to_first_token:2000. "
             "Example: --goodput time_to_first_token:1200 inter_token_latency:25"
         ),
     )
