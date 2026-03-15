@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from schedulers.action_tape import load_action_tape_data
+from schedulers.action_tape import ActionTape, load_action_tape_data
 
 _VALID_TOP_LEVEL_KEYS = {"actions"}
 
@@ -95,6 +95,46 @@ def strict_validate(payload: dict) -> list[str]:
     return errors
 
 
+def validate_tape_file(tape_path: Path) -> ActionTape:
+    """Validate a tape file and return the parsed ActionTape.
+
+    Raises ``ValueError`` on any validation failure.
+    Prints a warning to stderr if the tape has no eligible actions.
+    """
+    if not tape_path.exists():
+        raise ValueError(f"tape file not found: {tape_path}")
+
+    try:
+        payload = json.loads(tape_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"invalid JSON in {tape_path}: line {exc.lineno}, "
+            f"column {exc.colno}: {exc.msg}"
+        ) from exc
+
+    errors = strict_validate(payload)
+    if errors:
+        raise ValueError(
+            f"invalid tape in {tape_path}:\n" + "\n".join(f"  {e}" for e in errors)
+        )
+
+    tape = load_action_tape_data(payload)
+
+    has_eligible = (
+        any(a.eligible for _, a in tape.timed_actions)
+        or any(a.eligible for a in tape.arrival_actions.values())
+    )
+    if not has_eligible:
+        print(
+            f"WARNING: tape {tape_path} has no eligible actions. "
+            "No requests will be admitted — the scheduler will spin "
+            "with all requests stuck in the waiting queue.",
+            file=sys.stderr,
+        )
+
+    return tape
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Validate a tape-driven scheduler action tape JSON file"
@@ -107,31 +147,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    tape_path = Path(args.tape)
-    if not tape_path.exists():
-        print(f"ERROR: tape file not found: {tape_path}", file=sys.stderr)
-        return 1
-
     try:
-        payload = json.loads(tape_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        print(
-            f"ERROR: invalid JSON in {tape_path}: line {exc.lineno}, "
-            f"column {exc.colno}: {exc.msg}",
-            file=sys.stderr,
-        )
-        return 1
-
-    strict_errors = strict_validate(payload)
-    if strict_errors:
-        for err in strict_errors:
-            print(f"ERROR: {err}", file=sys.stderr)
-        return 1
-
-    try:
-        tape = load_action_tape_data(payload)
+        tape = validate_tape_file(Path(args.tape))
     except ValueError as exc:
-        print(f"ERROR: invalid tape format in {tape_path}: {exc}", file=sys.stderr)
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
     n_timed = len(tape.timed_actions)
@@ -143,9 +162,9 @@ def main() -> int:
             parts.append(f"{n_timed} time_ms")
         if n_arrival:
             parts.append(f"{n_arrival} on_arrival")
-        print(f"OK: {tape_path} is valid ({', '.join(parts)}; {total} total entries)")
+        print(f"OK: {args.tape} is valid ({', '.join(parts)}; {total} total entries)")
     else:
-        print(f"OK: {tape_path} is valid (0 entries)")
+        print(f"OK: {args.tape} is valid (0 entries)")
     return 0
 
 

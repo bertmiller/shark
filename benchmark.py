@@ -20,8 +20,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from schedulers.action_tape import load_action_tape_data
-from validate import strict_validate
+from validate import validate_tape_file
 
 # ---------------------------------------------------------------------------
 # Config
@@ -67,46 +66,6 @@ def _patch_aiperf_headers():
         return headers
 
     BaseEndpoint.get_endpoint_headers = _patched
-
-
-def _validate_tape_file(tape_path: Path) -> None:
-    if not tape_path.exists():
-        print(f"ERROR: tape file not found: {tape_path}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        payload = json.loads(tape_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        print(
-            f"ERROR: invalid JSON in {tape_path}: line {exc.lineno}, "
-            f"column {exc.colno}: {exc.msg}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    strict_errors = strict_validate(payload)
-    if strict_errors:
-        for err in strict_errors:
-            print(f"ERROR: {err}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        actions = load_action_tape_data(payload)
-    except ValueError as exc:
-        print(f"ERROR: invalid tape format in {tape_path}: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    has_eligible = (
-        any(a.eligible for _, a in actions.timed_actions)
-        or any(a.eligible for a in actions.arrival_actions.values())
-    )
-    if not has_eligible:
-        print(
-            f"WARNING: tape {tape_path} has no eligible actions. "
-            "No requests will be admitted — the scheduler will spin "
-            "with all requests stuck in the waiting queue.",
-            file=sys.stderr,
-        )
 
 
 def _post_tape_reset(tape_path: Path, control_port: int) -> None:
@@ -255,7 +214,11 @@ def main():
 
     if args.action_tape:
         tape_path = Path(args.action_tape)
-        _validate_tape_file(tape_path)
+        try:
+            validate_tape_file(tape_path)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
         _post_tape_reset(tape_path, args.control_port)
 
     print(f"Running: aiperf {' '.join(aiperf_args)}\n")
