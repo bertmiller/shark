@@ -73,7 +73,7 @@ def main():
     # Ensure the tape file exists so the scheduler can start.
     tape_path = Path(args.action_tape)
     if not tape_path.exists():
-        tape_path.write_text('{"ticks": []}', encoding="utf-8")
+        tape_path.write_text('{"actions": []}', encoding="utf-8")
         print(f"Created empty tape: {tape_path}")
 
     action_tape_path = str(tape_path.resolve())

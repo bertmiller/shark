@@ -9,7 +9,12 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 MODEL_ID="${MODEL_ID:-$DEFAULT_MODEL_ID}"
 TRACE_BASE_URL="${TRACE_BASE_URL:-https://raw.githubusercontent.com/kvcache-ai/Mooncake/main/FAST25-release/traces}"
 VLLM_REPO_URL="${VLLM_REPO_URL:-https://github.com/vllm-project/vllm.git}"
-VLLM_REF="${VLLM_REF:-main}"
+VLLM_REF="${VLLM_REF:-95c0f928cdeeaa21c4906e73cee6a156e1b3b995}"
+SHARK_VLLM_PATCH="${SHARK_VLLM_PATCH:-$ROOT_DIR/patches/vllm-preserve-x-shark-headers.patch}"
+UV_SPEC="${UV_SPEC:-uv==0.10.9}"
+HUGGINGFACE_HUB_SPEC="${HUGGINGFACE_HUB_SPEC:-huggingface-hub[cli]==0.36.2}"
+AIPERF_SPEC="${AIPERF_SPEC:-aiperf==0.6.0.post1}"
+NVIDIA_ML_PY_SPEC="${NVIDIA_ML_PY_SPEC:-nvidia-ml-py==13.590.48}"
 APT_PACKAGES=(
   build-essential
   ca-certificates
@@ -66,10 +71,30 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
-echo
-echo "Refreshing vLLM checkout in $ROOT_DIR/vllm..."
-rm -rf "$ROOT_DIR/vllm"
-git clone --depth 1 --branch "$VLLM_REF" "$VLLM_REPO_URL" "$ROOT_DIR/vllm"
+refresh_vllm_checkout() {
+  echo
+  echo "Refreshing vLLM checkout in $ROOT_DIR/vllm at $VLLM_REF..."
+  rm -rf "$ROOT_DIR/vllm"
+  git clone "$VLLM_REPO_URL" "$ROOT_DIR/vllm"
+  git -C "$ROOT_DIR/vllm" checkout --detach "$VLLM_REF"
+}
+
+apply_shark_vllm_patch() {
+  local serving_file="$ROOT_DIR/vllm/vllm/entrypoints/openai/engine/serving.py"
+
+  if [[ ! -f "$SHARK_VLLM_PATCH" ]]; then
+    echo "Missing SHARK vLLM patch: $SHARK_VLLM_PATCH" >&2
+    exit 1
+  fi
+
+  if grep -Fq 'startswith("x-shark-")' "$serving_file"; then
+    echo "SHARK vLLM trace-header patch already present."
+    return
+  fi
+
+  echo "Applying SHARK vLLM trace-header patch..."
+  git -C "$ROOT_DIR/vllm" apply "$SHARK_VLLM_PATCH"
+}
 
 if ! need_cmd nvidia-smi; then
   echo "nvidia-smi not found. Install the NVIDIA driver first, then re-run setup.sh." >&2
@@ -94,13 +119,16 @@ PY
   exit 1
 fi
 
+refresh_vllm_checkout
+apply_shark_vllm_patch
+
 export PATH="$HOME/.local/bin:$PATH"
 export MODEL_ID MODEL_DIR
 
 if ! need_cmd uv; then
   echo
   echo "Installing uv..."
-  "$PYTHON_BIN" -m pip install --user -U uv
+  "$PYTHON_BIN" -m pip install --user -U "$UV_SPEC"
 fi
 
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
@@ -116,9 +144,9 @@ echo "Installing Python packages..."
 uv pip install --python "$VENV_PY" -U pip setuptools wheel
 uv pip install --python "$VENV_PY" -U hf_transfer
 uv pip install --python "$VENV_PY" -U \
-  "huggingface-hub[cli]" \
-  aiperf \
-  nvidia-ml-py
+  "$HUGGINGFACE_HUB_SPEC" \
+  "$AIPERF_SPEC" \
+  "$NVIDIA_ML_PY_SPEC"
 
 if ! need_cmd claude; then
   echo

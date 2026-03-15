@@ -1,8 +1,8 @@
 """Replay Mooncake traces against a running vLLM server via AIPerf.
 
 Assumes the server is already running (see setup.py). The scheduler
-auto-reloads the action tape when it detects the file has changed,
-so just overwrite the tape file and re-run this script.
+only loads a new action tape via the control server's `/reset`
+endpoint, which this script calls before each replay.
 
 Usage:
     python benchmark.py                                    # default: toolagent trace, 60s window
@@ -14,12 +14,14 @@ Usage:
 import argparse
 import json
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 from schedulers.action_tape import load_action_tape_data
+from validate import strict_validate
 
 # ---------------------------------------------------------------------------
 # Config
@@ -36,7 +38,7 @@ TRACES = {
 }
 
 DEFAULT_GOODPUT = [
-    "time_to_first_token:5000",
+    "time_to_first_token:15000",
 ]
 DEFAULT_TRACE = "toolagent"
 DEFAULT_RANDOM_SEED = 0
@@ -82,11 +84,29 @@ def _validate_tape_file(tape_path: Path) -> None:
         )
         sys.exit(1)
 
+    strict_errors = strict_validate(payload)
+    if strict_errors:
+        for err in strict_errors:
+            print(f"ERROR: {err}", file=sys.stderr)
+        sys.exit(1)
+
     try:
-        load_action_tape_data(payload)
+        actions = load_action_tape_data(payload)
     except ValueError as exc:
         print(f"ERROR: invalid tape format in {tape_path}: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    has_eligible = (
+        any(a.eligible for _, a in actions.timed_actions)
+        or any(a.eligible for a in actions.arrival_actions.values())
+    )
+    if not has_eligible:
+        print(
+            f"WARNING: tape {tape_path} has no eligible actions. "
+            "No requests will be admitted — the scheduler will spin "
+            "with all requests stuck in the waiting queue.",
+            file=sys.stderr,
+        )
 
 
 def _post_tape_reset(tape_path: Path, control_port: int) -> None:
@@ -101,8 +121,12 @@ def _post_tape_reset(tape_path: Path, control_port: int) -> None:
                 headers={"Content-Type": "application/json"},
             )
             with urllib.request.urlopen(req, timeout=60) as resp:
+                body = resp.read().decode("utf-8", errors="replace").strip()
                 if resp.status == 200:
-                    print(f"Tape reset OK ({tape_path})")
+                    if body and body != "OK":
+                        print(f"Tape reset OK ({tape_path} -> {body})")
+                    else:
+                        print(f"Tape reset OK ({tape_path})")
                     return
                 print(f"WARNING: /reset returned {resp.status}")
                 return
@@ -170,13 +194,19 @@ def main():
         help="Port of the scheduler control server (default: 8001)",
     )
     parser.add_argument(
+        "--max-requests",
+        type=int,
+        default=None,
+        help="Maximum number of requests to send (default: all in window)",
+    )
+    parser.add_argument(
         "--goodput",
         nargs="+",
         metavar="METRIC:VALUE",
         default=None,
         help=(
             "Override the default AIPerf goodput SLOs. "
-            "Default: time_to_first_token:5000. "
+            "Default: time_to_first_token:15000. "
             "Example: --goodput time_to_first_token:1200 inter_token_latency:25"
         ),
     )
@@ -185,9 +215,25 @@ def main():
     trace_path = TRACES[args.trace]
     effective_goodput = args.goodput or DEFAULT_GOODPUT
 
-    print(f"Trace: {args.trace}  |  Window: {args.schedule_window}ms")
+    max_req_str = str(args.max_requests) if args.max_requests else "all"
+    print(f"Trace: {args.trace}  |  Window: {args.schedule_window}ms  |  Max requests: {max_req_str}")
     print(f"AIPerf random seed: {DEFAULT_RANDOM_SEED}")
     print(f"Goodput SLOs: {' '.join(effective_goodput)}\n")
+
+    effective_trace = trace_path
+    tmp_trace = None
+    if args.max_requests is not None:
+        tmp_trace = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8",
+        )
+        with open(trace_path, encoding="utf-8") as src:
+            for i, line in enumerate(src):
+                if i >= args.max_requests:
+                    break
+                tmp_trace.write(line)
+        tmp_trace.close()
+        effective_trace = Path(tmp_trace.name)
+        print(f"Truncated trace to {args.max_requests} requests: {tmp_trace.name}")
 
     aiperf_args = [
         "profile",
@@ -197,7 +243,7 @@ def main():
         "--tokenizer", MODEL,
         "--streaming",
         "--custom-dataset-type", "mooncake-trace",
-        "--input-file", str(trace_path),
+        "--input-file", str(effective_trace),
         "--random-seed", str(DEFAULT_RANDOM_SEED),
         "--synthesis-max-isl", str(args.max_model_len),
         "--fixed-schedule",
@@ -213,7 +259,11 @@ def main():
         _post_tape_reset(tape_path, args.control_port)
 
     print(f"Running: aiperf {' '.join(aiperf_args)}\n")
-    _run_aiperf_inprocess(aiperf_args)
+    try:
+        _run_aiperf_inprocess(aiperf_args)
+    finally:
+        if tmp_trace is not None:
+            Path(tmp_trace.name).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

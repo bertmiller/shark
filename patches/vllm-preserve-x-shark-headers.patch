@@ -1,0 +1,31 @@
+diff --git a/vllm/entrypoints/openai/engine/serving.py b/vllm/entrypoints/openai/engine/serving.py
+index e864f562..85476a82 100644
+--- a/vllm/entrypoints/openai/engine/serving.py
++++ b/vllm/entrypoints/openai/engine/serving.py
+@@ -1146,15 +1146,21 @@ class OpenAIServing:
+         self,
+         headers: Headers,
+     ) -> Mapping[str, str] | None:
+-        is_tracing_enabled = await self.engine_client.is_tracing_enabled()
++        result: dict[str, str] = {}
+ 
++        # W3C trace headers (only when OTel is enabled)
++        is_tracing_enabled = await self.engine_client.is_tracing_enabled()
+         if is_tracing_enabled:
+-            return extract_trace_headers(headers)
+-
+-        if contains_trace_headers(headers):
++            result.update(extract_trace_headers(headers))
++        elif contains_trace_headers(headers):
+             log_tracing_disabled_warning()
+ 
+-        return None
++        # Always extract X-Shark-* headers for scheduler metadata
++        for key, value in headers.items():
++            if key.lower().startswith("x-shark-"):
++                result[key.lower()] = value
++
++        return result if result else None
+ 
+     @staticmethod
+     def _base_request_id(

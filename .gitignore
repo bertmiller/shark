@@ -22,6 +22,7 @@ models/
 # Artifacts & traces
 artifacts/
 mooncake-traces/
+*.jsonl
 
 # IDE
 .idea/

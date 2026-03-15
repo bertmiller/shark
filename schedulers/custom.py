@@ -8,8 +8,6 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Iterable
 
-from schedulers.action_tape import ActionTapeRuntime, TickAction, load_action_tape_data
-
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -21,13 +19,25 @@ from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
+from schedulers.action_tape import ActionTape, ActionTapeRuntime, TickAction, load_action_tape_data
+
 logger = logging.getLogger(__name__)
 
 
 class _ControlHandler(BaseHTTPRequestHandler):
     """HTTP handler for the scheduler control server."""
 
+    """We need this to allow for new ActionTapes without restarting the server."""
+
     scheduler: "CustomScheduler"
+
+    def _send_reset_response(self) -> None:
+        log_name = self.scheduler._action_tape.current_log_name()
+        body = f"{log_name}\n" if log_name else "OK\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8"))
 
     def do_POST(self):
         if self.path != "/reset":
@@ -48,10 +58,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
         sched = self.scheduler
         if sched._can_apply_reset_immediately():
             sched._apply_reset(tape)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK\n")
+            self._send_reset_response()
             return
 
         sched._pending_tape = tape
@@ -59,10 +66,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
         sched._reset_requested.set()
 
         if sched._reset_done.wait(timeout=30):
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"OK\n")
+            self._send_reset_response()
         else:
             self.send_response(504)
             self.send_header("Content-Type", "text/plain")
@@ -90,7 +94,7 @@ class CustomScheduler(Scheduler):
 
         self._reset_requested = threading.Event()
         self._reset_done = threading.Event()
-        self._pending_tape: dict[int, TickAction] | None = None
+        self._pending_tape: ActionTape | None = None
 
         control_port = int(os.environ.get("SHARK_CONTROL_PORT", "8001"))
         handler = type(
@@ -109,10 +113,19 @@ class CustomScheduler(Scheduler):
     def _can_apply_reset_immediately(self) -> bool:
         return not self.running and not self.waiting
 
-    def _apply_reset(self, tape: dict[int, TickAction]) -> None:
+    def _apply_reset(self, tape: ActionTape) -> None:
         self._action_tape.reset_from_data(tape)
         self._pending_tape = None
         self._scheduler_tick = 0
+
+    def _collect_waiting_aliases(self) -> set[str]:
+        """Collect tape aliases for all requests currently in the waiting queue."""
+        aliases: set[str] = set()
+        for request in self.waiting:
+            alias = self._request_tape_alias(request)
+            if alias is not None:
+                aliases.add(alias)
+        return aliases
 
     def _record_ignored_action(
         self,
@@ -267,10 +280,12 @@ class CustomScheduler(Scheduler):
             kind="decode_priority",
             missing_reason="request is not running on this tick",
         )
-        self.running.sort(key=lambda request: (
-            requested_order.get(request.request_id, len(action.decode_priority)),
-            current_order[request.request_id],
-        ))
+        self.running.sort(
+            key=lambda request: (
+                requested_order.get(request.request_id, len(action.decode_priority)),
+                current_order[request.request_id],
+            )
+        )
 
     def _rebuild_waiting_queue(self, ordered_requests: list[Request]) -> None:
         rebuilt_waiting = create_request_queue(self.policy)
@@ -292,15 +307,17 @@ class CustomScheduler(Scheduler):
         }
         requested_order = self._resolve_request_order(
             waiting_requests,
-            action.admit,
+            action.eligible,
             record,
-            kind="admit",
+            kind="eligible",
             missing_reason="request is not waiting on this tick",
         )
-        waiting_requests.sort(key=lambda request: (
-            requested_order.get(request.request_id, len(action.admit)),
-            current_order[request.request_id],
-        ))
+        waiting_requests.sort(
+            key=lambda request: (
+                requested_order.get(request.request_id, len(action.eligible)),
+                current_order[request.request_id],
+            )
+        )
         self._rebuild_waiting_queue(waiting_requests)
         return set(requested_order)
 
@@ -310,7 +327,10 @@ class CustomScheduler(Scheduler):
         num_new_tokens: int,
         action: TickAction,
     ) -> int:
-        if action.prefill_chunk_tokens is None or request.num_computed_tokens >= request.num_tokens:
+        if (
+            action.prefill_chunk_tokens is None
+            or request.num_computed_tokens >= request.num_tokens
+        ):
             return num_new_tokens
 
         if action.prefill_chunk_tokens <= 0:
@@ -322,11 +342,10 @@ class CustomScheduler(Scheduler):
             self._apply_reset(self._pending_tape)
             self._reset_requested.clear()
             self._reset_done.set()
-        elif self._action_tape.maybe_reload():
-            self._scheduler_tick = 0
         tick = self._scheduler_tick
         self._scheduler_tick += 1
-        action = self._action_tape.action_for_tick(tick)
+        waiting_aliases = self._collect_waiting_aliases()
+        action = self._action_tape.actions_for_now(tick, time.monotonic(), waiting_aliases)
         record = self._action_tape.begin_tick(self, tick, action)
 
         scheduled_new_reqs: list[Request] = []
@@ -506,12 +525,14 @@ class CustomScheduler(Scheduler):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        if self._pause_state == PauseState.UNPAUSED and action.admit:
+        if self._pause_state == PauseState.UNPAUSED and action.eligible:
             allowed_request_ids = self._order_waiting_requests(action, record)
 
             skipped_waiting_requests = create_request_queue(self.policy)
 
-            while self.waiting and token_budget > 0 and action.prefill_chunk_tokens != 0:
+            while (
+                self.waiting and token_budget > 0 and action.prefill_chunk_tokens != 0
+            ):
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
